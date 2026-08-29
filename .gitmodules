@@ -1,0 +1,3 @@
+[submodule "awesome-agent-architecture"]
+	path = awesome-agent-architecture
+	url = https://github.com/hardness1020/awesome-agent-architecture.git
