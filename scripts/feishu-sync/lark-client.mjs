@@ -129,10 +129,10 @@ export class LarkClient {
     ]);
   }
 
-  async fetchDocument(objToken) {
+  async fetchDocument(objToken, { detail = "simple", docFormat = "markdown" } = {}) {
     const envelope = await this.run([
       "docs", "+fetch", "--doc", objToken, "--scope", "full",
-      "--detail", "simple", "--doc-format", "markdown", "--as", "bot", "--format", "json"
+      "--detail", detail, "--doc-format", docFormat, "--as", "bot", "--format", "json"
     ]);
     return envelope.data?.document ?? envelope.data;
   }

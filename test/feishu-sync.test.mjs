@@ -7,10 +7,12 @@ import test from "node:test";
 import {
   ROOT_KEY,
   buildActionPlan,
+  cleanupRemoteAssetCache,
   createManifest,
   deriveTitle,
   discoverPages,
   hasUnresolvedManagedLink,
+  materializeRemoteAssets,
   migrateRenames,
   parseManifest,
   serializeManifest,
@@ -31,6 +33,7 @@ test("discovers the complete simplified Chinese content model in source order", 
   assert.equal(model.sourcePages, 25);
   assert.equal(model.sectionPages, 24);
   assert.equal(model.localAssets, 26);
+  assert.equal(model.mirroredRemoteAssets, 1);
   assert.equal(pages[0].stableKey, ROOT_KEY);
   assert.equal(pages[1].stableKey, "sections/00-harness-thesis/README.zh-CN.md");
   assert.equal(pages[22].stableKey, "sections/23-evaluation/README.zh-CN.md");
@@ -52,30 +55,74 @@ test("transforms links and images deterministically without touching code fences
     sourcePath: ROOT_KEY,
     parentKey: null,
     title: "Root",
-    rawContent: "# Root\n\n[Page](sections/page/README.zh-CN.md#part)\n\n![Image](assets/image.png)\n\n![Remote](https://example.com/remote.png)\n\n```md\n[Literal](README.zh-CN.md)\n```",
+    rawContent: "# Root\n\n[Page](sections/page/README.zh-CN.md#part)\n\n![Image](assets/image.png)\n\n![Remote](https://example.com/remote.png)\n\n<img src=\"https://github.com/user-attachments/assets/472d8152-5e46-4e39-9f09-e77dcd07936a\" alt=\"Animated hero\">\n\n```md\n[Literal](README.zh-CN.md)\n```",
     assets: ["assets/image.png"],
+    remoteAssets: ["https://github.com/user-attachments/assets/472d8152-5e46-4e39-9f09-e77dcd07936a"],
     commit
   };
   const nodeMap = new Map([
     [ROOT_KEY, { nodeToken: "root" }],
     ["sections/page/README.zh-CN.md", { nodeToken: "child" }]
   ]);
-  const first = transformPage(page, nodeMap, temporaryDir);
-  const second = transformPage(page, nodeMap, temporaryDir);
+  const remoteAssets = new Map([
+    [page.remoteAssets[0], {
+      relativePath: ".feishu-sync-assets/472d8152-5e46-4e39-9f09-e77dcd07936a.gif",
+      hash: "remote-gif-hash",
+      extension: "gif",
+      size: 12
+    }]
+  ]);
+  const first = transformPage(page, nodeMap, temporaryDir, undefined, remoteAssets);
+  const second = transformPage(page, nodeMap, temporaryDir, undefined, remoteAssets);
   assert.equal(first.body, second.body);
   assert.equal(first.renderHash, second.renderHash);
   assert.match(first.body, /https:\/\/feishu\.cn\/wiki\/child/);
   assert.match(first.body, /!\[Image\]\(@\.\/assets\/image\.png\)/);
   assert.match(first.body, /\[图片：Remote\]\(https:\/\/example\.com\/remote\.png\)/);
   assert.doesNotMatch(first.body, /!\[Remote\]/);
+  assert.match(first.body, /!\[Animated hero\]\(@\.\/\.feishu-sync-assets\/472d8152-5e46-4e39-9f09-e77dcd07936a\.gif\)/);
   assert.match(first.body, /\[Literal\]\(README\.zh-CN\.md\)/);
   assert.doesNotMatch(first.body, /本页由 GitHub 仓库单向同步/);
   assert.doesNotMatch(first.body, /上游提交/);
   assert.equal(first.warnings.length, 1);
 
   fs.writeFileSync(path.join(temporaryDir, "assets", "image.png"), "image-two");
-  const changed = transformPage(page, nodeMap, temporaryDir);
+  const changed = transformPage(page, nodeMap, temporaryDir, undefined, remoteAssets);
   assert.notEqual(first.renderHash, changed.renderHash);
+});
+
+test("materializes trusted GitHub attachments as managed GIF assets", async () => {
+  const temporaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-sync-remote-"));
+  const url = "https://github.com/user-attachments/assets/472d8152-5e46-4e39-9f09-e77dcd07936a";
+  const bytes = Buffer.from("GIF89a-managed-animation");
+  const fakeFetch = async (requestedUrl) => {
+    assert.equal(requestedUrl, url);
+    return new Response(bytes, {
+      status: 200,
+      headers: { "content-length": String(bytes.length), "content-type": "image/gif" }
+    });
+  };
+  const assets = await materializeRemoteAssets([{ remoteAssets: [url] }], temporaryDir, fakeFetch);
+  const asset = assets.get(url);
+  assert.equal(asset.extension, "gif");
+  assert.equal(asset.size, bytes.length);
+  assert.equal(fs.readFileSync(path.join(temporaryDir, asset.relativePath)).toString(), bytes.toString());
+  cleanupRemoteAssetCache(temporaryDir);
+  assert.equal(fs.existsSync(path.join(temporaryDir, ".feishu-sync-assets")), false);
+
+  let fallbackCalled = false;
+  const fallbackAssets = await materializeRemoteAssets(
+    [{ remoteAssets: [url] }],
+    temporaryDir,
+    async () => { throw new Error("simulated fetch failure"); },
+    async () => {
+      fallbackCalled = true;
+      return bytes;
+    }
+  );
+  assert.equal(fallbackCalled, true);
+  assert.equal(fallbackAssets.get(url).extension, "gif");
+  cleanupRemoteAssetCache(temporaryDir);
 });
 
 test("fails on unsupported formulas and missing assets", () => {
@@ -150,6 +197,7 @@ class FakeLarkClient {
     this.documents = new Map();
     this.writeCalls = [];
     this.failDocumentToken = "";
+    this.forceGifAsJpeg = false;
     this.addNode({
       nodeToken: "root-node",
       objToken: "root-doc",
@@ -211,8 +259,14 @@ class FakeLarkClient {
     this.writeCalls.push(["move", nodeToken]);
   }
 
-  async fetchDocument(objToken) {
-    return structuredClone(this.documents.get(objToken));
+  async fetchDocument(objToken, { docFormat = "markdown" } = {}) {
+    const document = structuredClone(this.documents.get(objToken));
+    if (docFormat === "xml") {
+      const gifCount = (document.content.match(/\.gif\)/g) ?? []).length;
+      const mime = this.forceGifAsJpeg ? "image/jpeg" : "image/gif";
+      document.content = Array.from({ length: gifCount }, () => `<img mime="${mime}"/>`).join("\n");
+    }
+    return document;
   }
 
   async overwriteDocument(objToken, content) {
@@ -267,6 +321,41 @@ test("bootstrap apply checkpoints state and an unchanged rerun is a no-op", asyn
   const second = await synchronizer.apply(pages, "incremental");
   assert.equal(second.updated, 0);
   assert.equal(second.skipped, 2);
+  const verification = await synchronizer.verify(pages);
+  assert.equal(verification.verifiedPages, 2);
+  client.documents.get("root-doc").revision_id += 1;
+  await assert.rejects(() => synchronizer.verify(pages), /remote revision drift detected/);
+});
+
+test("verify requires mirrored GIF attachments to remain GIF resources", async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-sync-gif-"));
+  const url = "https://github.com/user-attachments/assets/472d8152-5e46-4e39-9f09-e77dcd07936a";
+  fs.writeFileSync(
+    path.join(directory, ROOT_KEY),
+    `# Root\n\n<img src="${url}" alt="Animated hero">\n`
+  );
+  const pages = discoverPages(directory, commit);
+  const remoteAssets = new Map([
+    [url, {
+      relativePath: ".feishu-sync-assets/472d8152-5e46-4e39-9f09-e77dcd07936a.gif",
+      hash: "remote-gif-hash",
+      extension: "gif",
+      size: 12
+    }]
+  ]);
+  const client = new FakeLarkClient();
+  const synchronizer = new WikiSynchronizer({
+    client,
+    sourceDir: directory,
+    spaceId: "space",
+    rootNodeToken: "root-node",
+    commit,
+    remoteAssets
+  });
+  await synchronizer.apply(pages, "full", { bootstrap: true });
+  assert.equal((await synchronizer.verify(pages)).verifiedPages, 1);
+  client.forceGifAsJpeg = true;
+  await assert.rejects(() => synchronizer.verify(pages), /expected 1 image\/gif resource/);
 });
 
 test("asset bytes trigger an update and removed pages are archived", async () => {

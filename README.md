@@ -2,13 +2,14 @@
 
 本仓库维护 [`awesome-agent-architecture`](https://github.com/hardness1020/awesome-agent-architecture) 的 Git 子模块，并将其中的简体中文内容持续镜像到飞书知识库。
 
-当前镜像包含 25 个 `README.zh-CN.md` 页面和 26 个本地图片资源。仓库是内容的唯一来源；同步程序不会在页面末尾附加同步声明、源文件链接或上游提交 SHA。
+当前镜像包含 25 个 `README.zh-CN.md` 页面、26 个仓库本地图片资源，以及 1 个 GitHub Attachment 动图。仓库是内容的唯一来源；同步程序不会在页面末尾附加同步声明、源文件链接或上游提交 SHA。
 
 ## 功能
 
 - 按上游中文目录顺序维护飞书 Wiki 层级。
 - 将中文内部链接改写为飞书 Wiki 节点链接。
 - 上传本地图片，并将图片字节纳入内容哈希。
+- 将受信任的 GitHub Attachment 下载到受管临时缓存后作为本地素材上传，避免 GIF 被飞书远端抓取转换成静态图片。
 - 支持只读计划、增量同步、完整同步和远端验证。
 - 使用远端版本化清单保存节点 Token、正文哈希和同步状态。
 - 保留重命名节点的 Token，并将上游删除内容移动到归档节点。
@@ -31,6 +32,7 @@
 
 - Node.js 22 或更高版本
 - Git
+- curl（Node 网络请求失败时用于公开附件下载回退）
 - `@larksuite/cli@1.0.86`
 - 已获得目标飞书知识空间权限的飞书应用
 
@@ -137,6 +139,7 @@ chore: update awesome-agent-architecture submodule
 - 重复 Token、清单损坏或父子关系漂移会使同步失败并停止写入。
 - 上游删除的最高层受管节点会移动到“归档（系统）”。
 - 同一知识空间内的写操作保持串行，并对临时网络故障进行有限重试。
+- GitHub Attachment 仅允许稳定的 `github.com/user-attachments/assets/...` 地址；临时签名 URL 不会保存，上传结束后清理缓存。
 - 日志和同步报告不得包含应用 Secret 或访问令牌。
 
 ## 飞书镜像

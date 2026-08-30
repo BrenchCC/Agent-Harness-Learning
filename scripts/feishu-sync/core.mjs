@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 
 export const CONVERTER_VERSION = "2";
 export const MANIFEST_SCHEMA_VERSION = 1;
@@ -12,6 +13,10 @@ export const STATE_MARKER = "AWESOME_AGENT_ARCHITECTURE_SYNC_STATE";
 
 const GITHUB_REPOSITORY_URL = "https://github.com/hardness1020/awesome-agent-architecture";
 const DEFAULT_WIKI_BASE_URL = "https://feishu.cn/wiki";
+const REMOTE_ASSET_CACHE_DIR = ".feishu-sync-assets";
+const REMOTE_ASSET_MARKER = ".managed-by-agent-harness-learning";
+const GITHUB_ATTACHMENT_PATTERN = /https:\/\/github\.com\/user-attachments\/assets\/[A-Za-z0-9-]+/g;
+const MAX_REMOTE_ASSET_BYTES = 25 * 1024 * 1024;
 
 function normalizePath(value) {
   return value.split(path.sep).join("/").replace(/^\.\//, "");
@@ -19,6 +24,119 @@ function normalizePath(value) {
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function detectImageExtension(bytes) {
+  if (bytes.subarray(0, 6).toString("ascii") === "GIF87a" || bytes.subarray(0, 6).toString("ascii") === "GIF89a") {
+    return "gif";
+  }
+  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return "png";
+  }
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return "jpg";
+  }
+  if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") {
+    return "webp";
+  }
+  throw new Error("trusted remote attachment is not a supported image");
+}
+
+function remoteAssetCachePath(sourceDir) {
+  return path.join(sourceDir, REMOTE_ASSET_CACHE_DIR);
+}
+
+export function cleanupRemoteAssetCache(sourceDir) {
+  const cacheDir = remoteAssetCachePath(sourceDir);
+  const markerPath = path.join(cacheDir, REMOTE_ASSET_MARKER);
+  if (fs.existsSync(markerPath)) {
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+  }
+}
+
+function downloadRemoteAssetWithCurl(url) {
+  try {
+    return execFileSync("curl", [
+      "-fsSL",
+      "--max-time", "60",
+      "--max-filesize", String(MAX_REMOTE_ASSET_BYTES),
+      url
+    ], {
+      encoding: "buffer",
+      maxBuffer: MAX_REMOTE_ASSET_BYTES + 1024
+    });
+  } catch {
+    throw new Error("failed to download trusted remote attachment with fetch and curl");
+  }
+}
+
+async function downloadRemoteAsset(url, fetchImpl, fallbackImpl) {
+  try {
+    const response = await fetchImpl(url, {
+      redirect: "follow",
+      headers: { "User-Agent": "Agent-Harness-Learning-Feishu-Sync" }
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const declaredSize = Number(response.headers.get("content-length") ?? 0);
+    if (declaredSize > MAX_REMOTE_ASSET_BYTES) {
+      throw new Error("declared remote attachment is too large");
+    }
+    return Buffer.from(await response.arrayBuffer());
+  } catch {
+    return Buffer.from(await fallbackImpl(url));
+  }
+}
+
+export async function materializeRemoteAssets(
+  pages,
+  sourceDir,
+  fetchImpl = globalThis.fetch,
+  fallbackImpl = downloadRemoteAssetWithCurl
+) {
+  const urls = [...new Set(pages.flatMap((page) => page.remoteAssets))].sort();
+  const assets = new Map();
+  if (urls.length === 0) {
+    return assets;
+  }
+
+  const cacheDir = remoteAssetCachePath(sourceDir);
+  if (fs.existsSync(cacheDir) && !fs.existsSync(path.join(cacheDir, REMOTE_ASSET_MARKER))) {
+    throw new Error(`${REMOTE_ASSET_CACHE_DIR} exists without the managed cache marker`);
+  }
+  cleanupRemoteAssetCache(sourceDir);
+  fs.mkdirSync(cacheDir, { recursive: true });
+  fs.writeFileSync(path.join(cacheDir, REMOTE_ASSET_MARKER), "managed transient assets\n", { mode: 0o600 });
+
+  const hasConfiguredProxy = Boolean(
+    process.env.HTTPS_PROXY
+    || process.env.https_proxy
+    || process.env.HTTP_PROXY
+    || process.env.http_proxy
+    || process.env.ALL_PROXY
+    || process.env.all_proxy
+  );
+  const preferFallback = fetchImpl === globalThis.fetch && hasConfiguredProxy;
+  for (const url of urls) {
+    const bytes = preferFallback
+      ? Buffer.from(await fallbackImpl(url))
+      : await downloadRemoteAsset(url, fetchImpl, fallbackImpl);
+    if (bytes.length === 0 || bytes.length > MAX_REMOTE_ASSET_BYTES) {
+      throw new Error(`trusted remote attachment has invalid size: ${bytes.length}`);
+    }
+    const extension = detectImageExtension(bytes);
+    const assetId = url.slice(url.lastIndexOf("/") + 1);
+    const relativePath = `${REMOTE_ASSET_CACHE_DIR}/${assetId}.${extension}`;
+    fs.writeFileSync(path.join(sourceDir, relativePath), bytes, { mode: 0o600 });
+    assets.set(url, {
+      relativePath,
+      hash: sha256(bytes),
+      extension,
+      size: bytes.length
+    });
+  }
+  return assets;
 }
 
 function stripInlineMarkdown(value) {
@@ -105,11 +223,19 @@ function extractMarkdownImages(content, sourcePath, sourceDir) {
   return assets;
 }
 
+function extractManagedRemoteImages(content) {
+  return [...new Set(content.match(GITHUB_ATTACHMENT_PATTERN) ?? [])].sort();
+}
+
 function convertHtml(content) {
   return content
     .replace(
       /<a\s+href="([^"]+)"[^>]*>\s*<img\s+src="([^"]+)"\s+alt="([^"]*)"[^>]*>\s*<\/a>/gi,
       "[$3]($1)"
+    )
+    .replace(
+      /<img\s+src="(https:\/\/github\.com\/user-attachments\/assets\/[A-Za-z0-9-]+)"\s+alt="([^"]*)"[^>]*>/gi,
+      "![$2]($1)"
     )
     .replace(/<img\s+src="([^"]+)"\s+alt="([^"]*)"[^>]*>/gi, "[图片：$2]($1)")
     .replace(/<img\s+src="([^"]+)"[^>]*>/gi, "[外部图片]($1)")
@@ -167,8 +293,15 @@ function rewriteLinks(content, page, nodeMap, warnings, wikiBaseUrl) {
   });
 }
 
-function rewriteImages(content, page) {
+function rewriteImages(content, page, remoteAssets) {
   return content.replace(/!\[([^\]]*)\]\((?:<)?([^)>\s]+)(?:>)?\)/g, (full, alt, target) => {
+    if (/^https:\/\/github\.com\/user-attachments\/assets\/[A-Za-z0-9-]+$/i.test(target)) {
+      const asset = remoteAssets.get(target);
+      if (!asset) {
+        throw new Error(`${page.sourcePath}: trusted remote image was not materialized`);
+      }
+      return `![${alt}](@./${asset.relativePath})`;
+    }
     if (/^https?:/i.test(target)) {
       return `[图片：${alt || "外部图片"}](${target})`;
     }
@@ -180,14 +313,20 @@ function rewriteImages(content, page) {
   });
 }
 
-export function transformPage(page, nodeMap, sourceDir, wikiBaseUrl = DEFAULT_WIKI_BASE_URL) {
+export function transformPage(
+  page,
+  nodeMap,
+  sourceDir,
+  wikiBaseUrl = DEFAULT_WIKI_BASE_URL,
+  remoteAssets = new Map()
+) {
   validateSupportedMarkdown(page.rawContent, page.sourcePath);
   const warnings = [];
   const { protectedContent, fences } = protectCodeFences(page.rawContent.replace(/\r\n/g, "\n"));
   let content = convertHtml(protectedContent);
   content = removeDuplicateTitle(content, page.title);
   content = rewriteLinks(content, page, nodeMap, warnings, wikiBaseUrl.replace(/\/$/, ""));
-  content = rewriteImages(content, page);
+  content = rewriteImages(content, page, remoteAssets);
   content = restoreCodeFences(content, fences).trim();
 
   const body = `${content}\n`;
@@ -197,12 +336,22 @@ export function transformPage(page, nodeMap, sourceDir, wikiBaseUrl = DEFAULT_WI
       return `${assetPath}\u0000${sha256(bytes)}`;
     })
     .sort();
+  const remoteAssetEntries = page.remoteAssets
+    .map((url) => {
+      const asset = remoteAssets.get(url);
+      if (!asset) {
+        throw new Error(`${page.sourcePath}: trusted remote image was not materialized`);
+      }
+      return `${url}\u0000${asset.hash}`;
+    })
+    .sort();
   const renderHash = sha256([
     CONVERTER_VERSION,
     body,
     page.title,
     page.parentKey ?? "",
-    ...assetEntries
+    ...assetEntries,
+    ...remoteAssetEntries
   ].join("\u0000"));
   return { body, renderHash, warnings };
 }
@@ -251,6 +400,7 @@ export function discoverPages(sourceDir, commit) {
       title: deriveTitle(rawContent, sourcePath),
       rawContent,
       assets: extractMarkdownImages(rawContent, sourcePath, sourceDir),
+      remoteAssets: extractManagedRemoteImages(rawContent),
       order,
       commit
     };
@@ -396,6 +546,7 @@ export function summarizeModel(pages) {
     sectionPages: pages.filter((page) => page.parentKey === ROOT_KEY).length,
     syntheticNodes: 0,
     localAssets: pages.reduce((count, page) => count + page.assets.length, 0),
+    mirroredRemoteAssets: new Set(pages.flatMap((page) => page.remoteAssets)).size,
     titles: pages.map((page) => page.title)
   };
 }

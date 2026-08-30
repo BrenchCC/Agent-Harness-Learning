@@ -5,9 +5,16 @@ import path from "node:path";
 import process from "node:process";
 import { execFileSync } from "node:child_process";
 
-import { discoverPages, summarizeModel } from "./feishu-sync/core.mjs";
+import {
+  cleanupRemoteAssetCache,
+  discoverPages,
+  materializeRemoteAssets,
+  summarizeModel
+} from "./feishu-sync/core.mjs";
 import { LarkClient } from "./feishu-sync/lark-client.mjs";
 import { WikiSynchronizer } from "./feishu-sync/sync.mjs";
+
+let transientAssetSourceDir = "";
 
 function parseArgs(argv) {
   const options = {
@@ -111,9 +118,11 @@ async function main() {
     throw new Error(`unsupported mode: ${options.mode}`);
   }
   const sourceDir = path.resolve(options.sourceDir);
+  transientAssetSourceDir = sourceDir;
   const commit = resolveCommit(sourceDir, options.commit);
   const context = reportContext({ ...options, sourceDir, commit });
   const pages = discoverPages(sourceDir, commit);
+  const remoteAssets = await materializeRemoteAssets(pages, sourceDir);
   const model = summarizeModel(pages);
   if (model.sourcePages !== 25 || model.sectionPages !== 24 || model.localAssets !== 26) {
     throw new Error(`unexpected source inventory: ${JSON.stringify(model)}`);
@@ -137,7 +146,8 @@ async function main() {
     sourceDir,
     spaceId,
     rootNodeToken,
-    commit
+    commit,
+    remoteAssets
   });
 
   let result;
@@ -184,4 +194,8 @@ main().catch((error) => {
   });
   process.stderr.write(`${error.message}\n`);
   process.exitCode = 1;
+}).finally(() => {
+  if (transientAssetSourceDir) {
+    cleanupRemoteAssetCache(transientAssetSourceDir);
+  }
 });

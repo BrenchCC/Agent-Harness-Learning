@@ -42,13 +42,14 @@ function reportTemplate(commit) {
 }
 
 export class WikiSynchronizer {
-  constructor({ client, sourceDir, spaceId, rootNodeToken, commit, renames = [] }) {
+  constructor({ client, sourceDir, spaceId, rootNodeToken, commit, renames = [], remoteAssets = new Map() }) {
     this.client = client;
     this.sourceDir = sourceDir;
     this.spaceId = String(spaceId);
     this.rootNodeToken = rootNodeToken;
     this.commit = commit;
     this.renames = renames;
+    this.remoteAssets = remoteAssets;
     this.stateNode = null;
     this.wikiBaseUrl = "https://feishu.cn/wiki";
   }
@@ -180,7 +181,7 @@ export class WikiSynchronizer {
         }
         continue;
       }
-      const rendered = transformPage(page, nodeMap, this.sourceDir, this.wikiBaseUrl);
+      const rendered = transformPage(page, nodeMap, this.sourceDir, this.wikiBaseUrl, this.remoteAssets);
       if (current.renderHash !== rendered.renderHash && !actions.some((item) => item.action === "update" && item.key === page.stableKey)) {
         actions.push({ action: "update", key: page.stableKey, reason: "hash_changed" });
       }
@@ -229,13 +230,17 @@ export class WikiSynchronizer {
 
       const nodeMap = new Map(Object.entries(manifest.pages).map(([key, value]) => [key, value]));
       for (const page of pages) {
-        const rendered = transformPage(page, nodeMap, this.sourceDir, this.wikiBaseUrl);
+        const rendered = transformPage(page, nodeMap, this.sourceDir, this.wikiBaseUrl, this.remoteAssets);
         report.warnings.push(...rendered.warnings);
         const remote = manifest.pages[page.stableKey];
         if (mode === "full" || remote.renderHash !== rendered.renderHash) {
-          const result = await this.client.overwriteDocument(remote.objToken, rendered.body);
+          await this.client.overwriteDocument(remote.objToken, rendered.body);
+          const writtenDocument = await this.client.fetchDocument(remote.objToken);
           remote.renderHash = rendered.renderHash;
-          remote.revisionId = Number(result.revision_id ?? result.revisionId ?? remote.revisionId ?? 0);
+          remote.revisionId = Number(
+            writtenDocument.revision_id ?? writtenDocument.revisionId ?? remote.revisionId ?? 0
+          );
+          remote.revisionVerified = true;
           report.updated += 1;
           await this.#saveManifest(manifest);
         } else {
@@ -292,6 +297,7 @@ export class WikiSynchronizer {
     }
 
     const warnings = [];
+    const nodeMap = new Map(Object.entries(manifest.pages).map(([key, value]) => [key, value]));
     for (const page of pages) {
       const remote = manifest.pages[page.stableKey];
       if (!remote || remote.title !== page.title) {
@@ -299,13 +305,40 @@ export class WikiSynchronizer {
       }
       const document = await this.client.fetchDocument(remote.objToken);
       const content = document.content ?? "";
-      if (!content.includes(this.commit) || hasUnresolvedManagedLink(content)) {
-        throw new Error(`content marker or internal link verification failed: ${page.stableKey}`);
+      const rendered = transformPage(page, nodeMap, this.sourceDir, this.wikiBaseUrl, this.remoteAssets);
+      if (remote.renderHash !== rendered.renderHash) {
+        throw new Error(`render hash verification failed: ${page.stableKey}`);
       }
-      const expectedImages = page.assets.length;
+      const revisionId = Number(document.revision_id ?? document.revisionId ?? 0);
+      if (remote.revisionVerified && revisionId > 0 && Number(remote.revisionId) !== revisionId) {
+        throw new Error(`remote revision drift detected: ${page.stableKey}`);
+      }
+      if (hasUnresolvedManagedLink(content)) {
+        throw new Error(`internal link verification failed: ${page.stableKey}`);
+      }
+      const expectedImages = page.assets.length + page.remoteAssets.length;
       const actualImages = (content.match(/!\[[^\]]*\]\([^)]+\)|<img\b/g) ?? []).length;
       if (actualImages < expectedImages) {
         warnings.push(`${page.stableKey}: expected ${expectedImages} local image(s), fetched ${actualImages}`);
+      }
+      if (page.remoteAssets.length > 0) {
+        const xmlDocument = await this.client.fetchDocument(remote.objToken, {
+          detail: "full",
+          docFormat: "xml"
+        });
+        const xmlContent = xmlDocument.content ?? "";
+        const expectedMimes = new Map();
+        for (const url of page.remoteAssets) {
+          const extension = this.remoteAssets.get(url)?.extension;
+          const mime = extension === "jpg" ? "image/jpeg" : `image/${extension}`;
+          expectedMimes.set(mime, (expectedMimes.get(mime) ?? 0) + 1);
+        }
+        for (const [mime, expectedCount] of expectedMimes) {
+          const actualCount = xmlContent.split(`mime="${mime}"`).length - 1;
+          if (actualCount < expectedCount) {
+            throw new Error(`${page.stableKey}: expected ${expectedCount} ${mime} resource(s), fetched ${actualCount}`);
+          }
+        }
       }
     }
     const spaces = await this.client.listSpaces();
