@@ -1,0 +1,12 @@
+{
+  "name": "agent-harness-learning",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:feishu-sync": "node scripts/feishu-wiki-sync.mjs check",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

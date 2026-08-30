@@ -1,0 +1,151 @@
+name: Sync Awesome Agent Architecture CN
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Remote operation
+        required: true
+        default: apply
+        type: choice
+        options:
+          - plan
+          - apply
+          - verify
+      mode:
+        description: Synchronization mode
+        required: true
+        default: incremental
+        type: choice
+        options:
+          - incremental
+          - full
+  pull_request:
+    paths:
+      - ".github/workflows/sync-awesome-agent-architecture.yml"
+      - "package.json"
+      - "scripts/feishu-sync/**"
+      - "scripts/feishu-wiki-sync.mjs"
+      - "test/feishu-sync.test.mjs"
+      - ".gitmodules"
+
+concurrency:
+  group: awesome-agent-architecture-cn-sync
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+      - run: npm test
+      - run: npm run check:feishu-sync
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: feishu-sync-local-check
+          path: artifacts/feishu-sync-report.json
+          if-no-files-found: error
+          retention-days: 14
+
+  sync:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      FEISHU_SPACE_ID: ${{ vars.FEISHU_SPACE_ID }}
+      FEISHU_ROOT_NODE_TOKEN: ${{ vars.FEISHU_ROOT_NODE_TOKEN }}
+      FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+      FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+      LARK_PROFILE: wiki-sync-ci
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.18.0"
+
+      - name: Initialize machine-readable report
+        run: node scripts/feishu-wiki-sync.mjs check --report artifacts/feishu-sync-report.json
+
+      - name: Validate configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in FEISHU_SPACE_ID FEISHU_ROOT_NODE_TOKEN FEISHU_APP_ID FEISHU_APP_SECRET; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Required GitHub Secret or Variable is empty: ${name}"
+              exit 1
+            fi
+          done
+
+      - name: Install pinned Lark CLI
+        run: npm install --global @larksuite/cli@1.0.86
+
+      - name: Configure bot identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s' "$FEISHU_APP_SECRET" | lark-cli config init \
+            --app-id "$FEISHU_APP_ID" \
+            --app-secret-stdin \
+            --brand feishu \
+            --name "$LARK_PROFILE"
+
+      - name: Fetch and commit upstream submodule update
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          old_sha="$(git -C awesome-agent-architecture rev-parse HEAD)"
+          git -C awesome-agent-architecture fetch origin main
+          new_sha="$(git -C awesome-agent-architecture rev-parse origin/main)"
+          git -C awesome-agent-architecture checkout --detach "$new_sha"
+          if [[ "$old_sha" != "$new_sha" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add awesome-agent-architecture
+            git commit -m "chore: update awesome-agent-architecture submodule" \
+              -m "- Advance upstream from ${old_sha:0:12} to ${new_sha:0:12}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "upstream_sha=$new_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Synchronize Feishu Wiki
+        shell: bash
+        env:
+          OPERATION: ${{ github.event_name == 'workflow_dispatch' && inputs.operation || 'apply' }}
+          SYNC_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'incremental' }}
+        run: |
+          set -euo pipefail
+          node scripts/feishu-wiki-sync.mjs "$OPERATION" \
+            --mode "$SYNC_MODE" \
+            --commit "${{ steps.upstream.outputs.upstream_sha }}" \
+            --report artifacts/feishu-sync-report.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: feishu-sync-report-${{ github.run_id }}
+          path: artifacts/feishu-sync-report.json
+          if-no-files-found: error
+          retention-days: 30
