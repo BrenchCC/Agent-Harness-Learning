@@ -3,6 +3,17 @@ name: Sync Awesome Agent Architecture CN
 on:
   schedule:
     - cron: "0 4 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - "awesome-agent-architecture"
+      - ".github/workflows/sync-awesome-agent-architecture.yml"
+      - "package.json"
+      - "scripts/feishu-sync/**"
+      - "scripts/feishu-wiki-sync.mjs"
+      - "test/feishu-sync.test.mjs"
+      - ".gitmodules"
   workflow_dispatch:
     inputs:
       operation:

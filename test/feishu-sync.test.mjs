@@ -69,6 +69,8 @@ test("transforms links and images deterministically without touching code fences
   assert.match(first.body, /\[图片：Remote\]\(https:\/\/example\.com\/remote\.png\)/);
   assert.doesNotMatch(first.body, /!\[Remote\]/);
   assert.match(first.body, /\[Literal\]\(README\.zh-CN\.md\)/);
+  assert.doesNotMatch(first.body, /本页由 GitHub 仓库单向同步/);
+  assert.doesNotMatch(first.body, /上游提交/);
   assert.equal(first.warnings.length, 1);
 
   fs.writeFileSync(path.join(temporaryDir, "assets", "image.png"), "image-two");

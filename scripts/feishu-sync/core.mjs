@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-export const CONVERTER_VERSION = "1";
+export const CONVERTER_VERSION = "2";
 export const MANIFEST_SCHEMA_VERSION = 1;
 export const ROOT_KEY = "README.zh-CN.md";
 export const SYSTEM_TITLE = "系统（同步管理）";
@@ -190,12 +190,7 @@ export function transformPage(page, nodeMap, sourceDir, wikiBaseUrl = DEFAULT_WI
   content = rewriteImages(content, page);
   content = restoreCodeFences(content, fences).trim();
 
-  const footer = [
-    "---",
-    "> 本页由 GitHub 仓库单向同步，请勿直接编辑；手工修改会在下次同步时被覆盖。",
-    `> 来源：[${page.sourcePath}](${GITHUB_REPOSITORY_URL}/blob/${page.commit}/${encodeURI(page.sourcePath)}) · 上游提交：\`${page.commit}\``
-  ].join("\n");
-  const body = `${content}\n\n${footer}\n`;
+  const body = `${content}\n`;
   const assetEntries = page.assets
     .map((assetPath) => {
       const bytes = fs.readFileSync(path.join(sourceDir, assetPath));
