@@ -124,9 +124,6 @@ async function main() {
   const pages = discoverPages(sourceDir, commit);
   const remoteAssets = await materializeRemoteAssets(pages, sourceDir);
   const model = summarizeModel(pages);
-  if (model.sourcePages !== 25 || model.sectionPages !== 24 || model.localAssets !== 26) {
-    throw new Error(`unexpected source inventory: ${JSON.stringify(model)}`);
-  }
   if (options.command === "check") {
     writeReport(options.report, {
       ok: true,

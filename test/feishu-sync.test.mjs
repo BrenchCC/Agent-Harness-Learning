@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 
 import {
   ROOT_KEY,
@@ -30,14 +31,59 @@ const commit = "0123456789abcdef0123456789abcdef01234567";
 test("discovers the complete simplified Chinese content model in source order", () => {
   const pages = discoverPages(sourceDir, commit);
   const model = summarizeModel(pages);
-  assert.equal(model.sourcePages, 25);
-  assert.equal(model.sectionPages, 24);
-  assert.equal(model.localAssets, 26);
-  assert.equal(model.mirroredRemoteAssets, 1);
+  const sectionPaths = fs.readdirSync(path.join(sourceDir, "sections"))
+    .map((section) => `sections/${section}/${ROOT_KEY}`)
+    .filter((sourcePath) => fs.existsSync(path.join(sourceDir, sourcePath)));
+  assert.deepEqual(new Set(pages.map((page) => page.sourcePath)), new Set([ROOT_KEY, ...sectionPaths]));
+  assert.equal(model.sourcePages, sectionPaths.length + 1);
+  assert.equal(model.sectionPages, sectionPaths.length);
   assert.equal(pages[0].stableKey, ROOT_KEY);
   assert.equal(pages[1].stableKey, "sections/00-harness-thesis/README.zh-CN.md");
-  assert.equal(pages[22].stableKey, "sections/23-evaluation/README.zh-CN.md");
-  assert.equal(pages[24].stableKey, "sections/22-graph-engineering/README.zh-CN.md");
+  assert.ok(pages.findIndex((page) => page.stableKey === "sections/23-evaluation/README.zh-CN.md")
+    < pages.findIndex((page) => page.stableKey === "sections/21-loop-engineering/README.zh-CN.md"));
+  assert.equal(pages.at(-1).stableKey, "sections/22-graph-engineering/README.zh-CN.md");
+});
+
+test("CLI check accepts changing page and asset inventories", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "feishu-sync-inventory-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const remoteUrls = ["first-image", "second-image"]
+    .map((id) => `https://github.com/user-attachments/assets/${id}`);
+  const rootContent = ["# Learn Agent Architecture", "![Root](root.png)",
+    ...remoteUrls.map((url) => `![Remote](${url})`)];
+  fs.writeFileSync(path.join(directory, ROOT_KEY), rootContent.join("\n\n"));
+  fs.writeFileSync(path.join(directory, "root.png"), "root-image");
+  const preloadPath = path.join(directory, "fetch.mjs");
+  fs.writeFileSync(preloadPath, `
+    globalThis.fetch = async () => new Response(Buffer.from("GIF89a-fixture"));
+  `);
+  const reportPath = path.join(directory, "report.json");
+  const env = { ...process.env };
+  for (const name of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]) {
+    delete env[name];
+  }
+  for (let index = 0; index < 25; index += 1) {
+    const sectionDir = path.join(directory, "sections", String(index).padStart(2, "0"));
+    fs.mkdirSync(sectionDir, { recursive: true });
+    fs.writeFileSync(path.join(sectionDir, ROOT_KEY), `# Section ${index}\n\n![Image](image.png)\n`);
+    fs.writeFileSync(path.join(sectionDir, "image.png"), `section-image-${index}`);
+    if (index < 23) {
+      continue;
+    }
+    const result = spawnSync(process.execPath, [
+      "--import", preloadPath,
+      path.join(repositoryRoot, "scripts/feishu-wiki-sync.mjs"), "check",
+      "--source-dir", directory, "--commit", commit, "--report", reportPath
+    ], { cwd: repositoryRoot, encoding: "utf8", env });
+    assert.equal(result.status, 0, result.stderr);
+    const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+    assert.equal(report.ok, true);
+    assert.equal(report.model.sourcePages, index + 2);
+    assert.equal(report.model.sectionPages, index + 1);
+    assert.equal(report.model.localAssets, index + 2);
+    assert.equal(report.model.mirroredRemoteAssets, 2);
+    assert.equal(fs.existsSync(path.join(directory, ".feishu-sync-assets")), false);
+  }
 });
 
 test("derives clean titles from HTML, Markdown, and frontmatter", () => {

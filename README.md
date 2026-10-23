@@ -2,7 +2,7 @@
 
 本仓库维护 [`awesome-agent-architecture`](https://github.com/hardness1020/awesome-agent-architecture) 的 Git 子模块，并将其中的简体中文内容持续镜像到飞书知识库。
 
-当前镜像包含 25 个 `README.zh-CN.md` 页面、26 个仓库本地图片资源，以及 1 个 GitHub Attachment 动图。仓库是内容的唯一来源；同步程序不会在页面末尾附加同步声明、源文件链接或上游提交 SHA。
+同步程序自动发现 `README.zh-CN.md` 页面、本地图片和受信任的 GitHub Attachment，数量随上游内容变化，实际统计见同步报告。仓库是内容的唯一来源；同步程序不会在页面末尾附加同步声明、源文件链接或上游提交 SHA。
 
 ## 功能
 
